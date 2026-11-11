@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Alerts to Slack when specific IAM Identity Center permission sets are assigned
+  (or unassigned) to an account. Deploy in the MANAGEMENT account, in the region
+  where IAM Identity Center is enabled (its "home" region).
+  Flow: CloudTrail mgmt event -> EventBridge -> SNS -> Lambda -> Slack webhook.
+
+Parameters:
+  PermissionSetArns:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated permission set ARNs to watch, e.g.
+      arn:aws:sso:::permissionSet/ssoins-1234567890abcdef/ps-0123456789abcdef
+  SlackWebhookUrl:
+    Type: String
+    NoEcho: true
+    Description: Slack incoming webhook URL (stored in Secrets Manager).
+  AlertOnRemoval:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Also alert on DeleteAccountAssignment.
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Also subscribe this email to the SNS topic.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  IncludeRemoval: !Equals [!Ref AlertOnRemoval, "true"]
+
+Resources:
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Slack webhook for Identity Center permission set alerts
+      SecretString: !Ref SlackWebhookUrl
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: sso-permission-set-alerts
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt AssignmentRule.Arn
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  AssignmentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Watched Identity Center permission set (un)assignments
+      State: ENABLED
+      EventPattern:
+        source: [aws.sso]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [sso.amazonaws.com]
+          eventName: !If
+            - IncludeRemoval
+            - [CreateAccountAssignment, DeleteAccountAssignment]
+            - [CreateAccountAssignment]
+          errorCode: [{ exists: false }]
+          requestParameters:
+            permissionSetArn: !Ref PermissionSetArns
+      Targets:
+        - Id: sns
+          Arn: !Ref AlertTopic
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: enrich-and-read-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecret
+              - Effect: Allow
+                Action:
+                  - sso:ListInstances
+                  - sso:DescribePermissionSet
+                  - identitystore:DescribeUser
+                  - identitystore:DescribeGroup
+                  - organizations:DescribeAccount
+                Resource: "*"
+
+  NotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt NotifierRole.Arn
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref WebhookSecret
+      Code:
+        ZipFile: |
+          import json, os, urllib.request, boto3
+
+          sm = boto3.client("secretsmanager")
+          sso = boto3.client("sso-admin")
+          ids = boto3.client("identitystore")
+          org = boto3.client("organizations")
+          _webhook = None
+
+          def webhook():
+              global _webhook
+              if not _webhook:
+                  _webhook = sm.get_secret_value(SecretId=os.environ["SECRET_ARN"])["SecretString"]
+              return _webhook
+
+          def safe(fn, default):
+              try:
+                  return fn()
+              except Exception as e:
+                  print(f"enrichment failed: {e}")
+                  return default
+
+          def handler(event, context):
+              for rec in event["Records"]:
+                  d = json.loads(rec["Sns"]["Message"])["detail"]
+                  rp = d.get("requestParameters", {})
+                  action = "ASSIGNED" if d["eventName"] == "CreateAccountAssignment" else "REMOVED"
+                  emoji = ":lock:" if action == "ASSIGNED" else ":unlock:"
+
+                  ps_arn = rp.get("permissionSetArn", "?")
+                  inst_arn = rp.get("instanceArn", "")
+                  acct_id = rp.get("targetId", "?")
+                  ptype = rp.get("principalType", "?")
+                  pid = rp.get("principalId", "?")
+
+                  ps = safe(lambda: sso.describe_permission_set(
+                      InstanceArn=inst_arn, PermissionSetArn=ps_arn)["PermissionSet"]["Name"], ps_arn)
+                  acct = safe(lambda: org.describe_account(AccountId=acct_id)["Account"]["Name"], "unknown")
+
+                  store = safe(lambda: next(i["IdentityStoreId"] for i in sso.list_instances()["Instances"]
+                                            if i["InstanceArn"] == inst_arn), "unknown")
+                  mgmt_acct = d.get("recipientAccountId", "unknown")
+                  mgmt_name = safe(lambda: org.describe_account(AccountId=mgmt_acct)["Account"]["Name"], "unknown")
+
+                  def principal():
+                      if ptype == "USER":
+                          return ids.describe_user(IdentityStoreId=store, UserId=pid)["UserName"]
+                      return ids.describe_group(IdentityStoreId=store, GroupId=pid)["DisplayName"]
+                  who = safe(principal, pid)
+
+                  ui = d.get("userIdentity", {})
+                  actor = ui.get("arn") or ui.get("principalId", "unknown")
+
+                  text = (f"{emoji} *Highly Privileged Permission Set {action}*\n"
+                          f"*Management account:* {mgmt_name} ({mgmt_acct})\n"
+                          f"*SSO instance:* {inst_arn or '?'} (identity store: {store})\n"
+                          f"*Permission set:* {ps}\n"
+                          f"*Account:* {acct} ({acct_id})\n"
+                          f"*Principal:* {who} ({ptype})\n"
+                          f"*By:* {actor}\n"
+                          f"*Source IP:* {d.get('sourceIPAddress', '?')}\n"
+                          f"*Time:* {d.get('eventTime', '?')}")
+
+                  req = urllib.request.Request(
+                      webhook(), data=json.dumps({"text": text}).encode(),
+                      headers={"Content-Type": "application/json"})
+                  urllib.request.urlopen(req, timeout=10).read()
+
+  NotifierInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+  NotifierSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt NotifierFunction.Arn
+
+Outputs:
+  TopicArn:
+    Value: !Ref AlertTopic
+  RuleName:
+    Value: !Ref AssignmentRule
