@@ -1,10 +1,16 @@
 # SSO Permission Set Alerts
 
-Alerts to Slack when specific IAM Identity Center permission sets are assigned or unassigned to an account. Deploy in the AWS Management account in the region where IAM Identity Center is enabled (its "home" region).
+Alerts to Slack when specific IAM Identity Center permission sets are assigned or unassigned to an account, or when any permission set is assigned or unassigned to the management account or configured Control Tower audit and log archive accounts. Deploy in the AWS Management account in the region where IAM Identity Center is enabled (its "home" region).
 
 ## Overview
 
-This CloudFormation template creates an automated monitoring solution that watches for changes to AWS IAM Identity Center (formerly AWS SSO) permission set assignments. When a specified permission set is assigned to or removed from an account, an alert is sent to Slack with detailed information about the action.
+This CloudFormation template creates an automated monitoring solution that watches for changes to AWS IAM Identity Center (formerly AWS SSO) permission set assignments. When a specified permission set is assigned to or removed from an account, or any permission set targets the management account or a configured Control Tower account, an alert is sent to Slack with detailed information about the action.
+
+The EventBridge rule matches either a permission set in `PermissionSetArns` or a target account ID equal to the management, audit, or log archive account. Management-account monitoring uses the stack's `AWS::AccountId`. A Lambda-backed CloudFormation custom resource discovers the Control Tower accounts from the landing-zone manifest: `securityRoles.accountId` for audit and `centralizedLogging.accountId` for log archive. These accounts' permission sets do not need to be listed in `PermissionSetArns`. An event matching both criteria is routed once by the rule (delivery retries can still occur). `AlertOnRemoval` controls removal alerts for all monitored accounts and permission sets; failed API calls remain excluded.
+
+Leave `AuditAccountId` and `LogArchiveAccountId` empty for automatic discovery, or supply either as an override. Supplying both skips Control Tower API calls. Set `ControlTowerHomeRegion` if Control Tower's home region differs from the stack's Identity Center region. Missing or invalid discovered IDs, disabled manifest features, and API errors fail the stack operation explicitly rather than silently dropping monitoring. For landing zones without those features, provide explicit account IDs.
+
+Discovery runs on stack creation and when the custom resource's properties change. It is not continuous and does not run on unrelated stack updates. Change `DiscoveryRefreshToken` to a new value (for example, a date or revision) to force discovery on an update. The resolved IDs are exposed as stack outputs. Deleting the stack does not query or modify Control Tower.
 
 ### Key Features
 
@@ -12,6 +18,8 @@ This CloudFormation template creates an automated monitoring solution that watch
 - 📧 **Multi-channel Alerts**: Sends notifications to Slack and optionally to email
 - 🔍 **Rich Context**: Enriches alerts with permission set names, account names, and user details
 - ⚙️ **Configurable**: Customize which permission sets to monitor
+- 🏢 **Management Account Monitoring**: Alert on any permission set targeting the management account, regardless of the configured permission set list
+- **Control Tower Account Monitoring**: Automatically discover the audit and log archive accounts and alert on any permission set targeting them, with optional manual ID overrides
 - 🎛️ **Flexible Removal Alerts**: Optional alerting on permission set removal events
 
 ## Architecture
@@ -139,6 +147,7 @@ sequenceDiagram
 
 - AWS Management account access
 - IAM Identity Center enabled in a specific region
+- A Control Tower landing zone with audit and centralized logging accounts, or explicit overrides for both account IDs
 - Permission sets already created in Identity Center
 - Slack workspace with incoming webhook access
 - Appropriate IAM permissions to create CloudFormation stacks
@@ -147,7 +156,11 @@ sequenceDiagram
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `PermissionSetArns` | List | Required | Comma-separated permission set ARNs to monitor. Example: `arn:aws:sso:::permissionSet/ssoins-1234567890abcdef/ps-0123456789abcdef` |
+| `PermissionSetArns` | List | Required | Comma-separated permission set ARNs to monitor across all accounts. Any permission set targeting the management account or configured Control Tower accounts is also monitored. Example: `arn:aws:sso:::permissionSet/ssoins-1234567890abcdef/ps-0123456789abcdef` |
+| `AuditAccountId` | String | Empty | Optional 12-digit audit account ID override. Empty means discover from Control Tower. |
+| `LogArchiveAccountId` | String | Empty | Optional 12-digit log archive account ID override. Empty means discover from Control Tower. |
+| `ControlTowerHomeRegion` | String | Empty | Region used for Control Tower discovery. Empty means the stack region. |
+| `DiscoveryRefreshToken` | String | Empty | Change to a new value on a stack update to rerun discovery. |
 | `SlackWebhookUrl` | String | Required | Slack incoming webhook URL (stored securely in Secrets Manager). Get one from your Slack app's Incoming Webhooks settings. |
 | `AlertOnRemoval` | String | `true` | Set to `true` to also alert when permission sets are removed; `false` to alert only on assignments. |
 | `NotificationEmail` | String | Empty | Optional email address to also subscribe to SNS notifications. |
@@ -180,6 +193,10 @@ sequenceDiagram
      --capabilities CAPABILITY_NAMED_IAM \
      --region us-east-1
    ```
+
+   The example discovers both Control Tower account IDs automatically in `us-east-1`. If Control Tower has a different home region, supply `ControlTowerHomeRegion`. To override discovery, supply `AuditAccountId` and/or `LogArchiveAccountId`.
+
+   For an existing stack, update it with the modified template. Existing nonempty account ID parameters remain overrides; explicitly set them to empty strings to switch to discovery.
 
 4. **Verify Deployment**:
    ```bash
@@ -229,7 +246,10 @@ graph TB
 | `AlertTopic` | SNS Topic | Central hub for distributing alerts |
 | `AlertTopicPolicy` | IAM Policy | Grants EventBridge permission to publish to SNS |
 | `EmailSubscription` | SNS Subscription | Optional email notifications (conditional) |
-| `AssignmentRule` | EventBridge Rule | Filters CloudTrail events for permission set changes |
+| `AccountDiscoveryRole` | IAM Role | Allows the discovery Lambda to list landing zones and read the management account's landing-zone manifest |
+| `AccountDiscoveryFunction` | Lambda Function | Resolves audit and log archive IDs from overrides or Control Tower |
+| `ControlTowerAccounts` | Custom Resource | Supplies resolved account IDs to the EventBridge rule and stack outputs |
+| `AssignmentRule` | EventBridge Rule | Filters CloudTrail events for watched permission sets across all accounts or any permission set targeting the management or configured Control Tower accounts |
 | `NotifierRole` | IAM Role | Execution role for Lambda function |
 | `NotifierFunction` | Lambda Function | Enriches and formats alerts, posts to Slack |
 | `NotifierInvokePermission` | Lambda Permission | Grants SNS permission to invoke Lambda |
@@ -243,7 +263,7 @@ graph TB
 
 ### IAM Permissions
 
-The Lambda function requires the following permissions:
+The notifier Lambda function requires the following permissions:
 
 ```json
 {
@@ -268,6 +288,8 @@ The Lambda function requires the following permissions:
   ]
 }
 ```
+
+The separate discovery Lambda requires `controltower:ListLandingZones` on `*` and `controltower:GetLandingZone` on landing zones in the management account, plus basic Lambda logging permissions. It does not modify Control Tower or Organizations resources.
 
 ### Data Enrichment
 
@@ -311,9 +333,31 @@ aws logs tail /aws/lambda/sso-permset-alerts --follow
 | Lambda execution failures | Missing IAM permissions | Check Lambda execution role permissions |
 | Permission set name shows "?" | Insufficient permissions | Verify SSO Admin API permissions |
 | User/Group name shows "?" | Identity Store API errors | Check identity store configuration |
-| No events detected | EventBridge rule not matching | Verify permission set ARNs match exactly |
+| No events detected | EventBridge rule not matching | Verify permission set ARNs match exactly, or that the target account is the management account or a configured audit/log archive account |
+| Stack fails during account discovery | Wrong Control Tower region, missing permissions, or missing/disabled manifest features | Check the custom resource failure reason and discovery Lambda logs; set `ControlTowerHomeRegion` or explicit account ID overrides |
 
 ### Testing
+
+Local validation uses `cfn-lint` and its Python dependencies. The unit tests execute the inline discovery Lambda with SDK-stubbed responses; no AWS credentials or network calls are required:
+
+```powershell
+cfn-lint .\sso-permset-alerts.yaml
+python -B -m unittest discover -s .\tests -v
+```
+
+After updating the stack, verify the following using actual assignment events in the Identity Center home region:
+
+| Permission set | Target account | Expected alert |
+|----------------|----------------|----------------|
+| In `PermissionSetArns` | Other member account | Yes |
+| Not in `PermissionSetArns` | Management account | Yes |
+| In `PermissionSetArns` | Management account | Yes, routed once by the rule |
+| Not in `PermissionSetArns` | Discovered or overridden audit account | Yes |
+| Not in `PermissionSetArns` | Discovered or overridden log archive account | Yes |
+| In `PermissionSetArns` | Discovered or overridden audit or log archive account | Yes, routed once by the rule |
+| Not in `PermissionSetArns` | Other member account | No |
+
+Repeat with removal events: matching removals alert only when `AlertOnRemoval=true`. Failed API calls do not alert. Direct Lambda invocation tests formatting and delivery only; it bypasses EventBridge filtering.
 
 Manually invoke the Lambda function to test:
 
@@ -344,7 +388,7 @@ This solution uses the following AWS services:
 1. **Webhook URL Storage**: The Slack webhook URL is stored in AWS Secrets Manager with encryption at rest
 2. **IAM Least Privilege**: Lambda only has permissions to read necessary AWS APIs
 3. **CloudTrail Logging**: All API calls are logged in CloudTrail for audit trail
-4. **Event Filtering**: EventBridge filters events to only include desired permission sets
+4. **Event Filtering**: EventBridge includes watched permission sets across all accounts and all permission sets targeting the management or configured Control Tower accounts
 5. **Audit Trail**: All permission set changes are tracked with source IP and timestamp
 
 ### Additional Security Recommendations

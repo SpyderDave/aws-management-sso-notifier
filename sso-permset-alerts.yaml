@@ -1,7 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Alerts to Slack when specific IAM Identity Center permission sets are assigned
-  (or unassigned) to an account. Deploy in the MANAGEMENT account, in the region
+  (or unassigned) to an account, or any permission set targets the management
+  account or configured Control Tower audit and log archive accounts.
+  Deploy in the MANAGEMENT account, in the region
   where IAM Identity Center is enabled (its "home" region).
   Flow: CloudTrail mgmt event -> EventBridge -> SNS -> Lambda -> Slack webhook.
 
@@ -9,8 +11,30 @@ Parameters:
   PermissionSetArns:
     Type: CommaDelimitedList
     Description: >
-      Comma-separated permission set ARNs to watch, e.g.
+      Comma-separated permission set ARNs to watch across all accounts, e.g.
       arn:aws:sso:::permissionSet/ssoins-1234567890abcdef/ps-0123456789abcdef
+      Any permission set targeting the management account or configured
+      Control Tower audit and log archive accounts is also monitored.
+  AuditAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^([0-9]{12})?$"
+    ConstraintDescription: Must be a 12-digit AWS account ID or empty.
+    Description: Optional override for the Control Tower audit account ID. Leave empty to discover it.
+  LogArchiveAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^([0-9]{12})?$"
+    ConstraintDescription: Must be a 12-digit AWS account ID or empty.
+    Description: Optional override for the Control Tower log archive account ID. Leave empty to discover it.
+  ControlTowerHomeRegion:
+    Type: String
+    Default: ""
+    Description: Control Tower home region. Leave empty to use the stack region.
+  DiscoveryRefreshToken:
+    Type: String
+    Default: ""
+    Description: Change this value on a stack update to refresh discovered account IDs.
   SlackWebhookUrl:
     Type: String
     NoEcho: true
@@ -65,10 +89,118 @@ Resources:
       Protocol: email
       Endpoint: !Ref NotificationEmail
 
+  AccountDiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: discover-control-tower-accounts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: controltower:ListLandingZones
+                Resource: "*"
+              - Effect: Allow
+                Action: controltower:GetLandingZone
+                Resource: !Sub arn:${AWS::Partition}:controltower:*:${AWS::AccountId}:landingzone/*
+
+  AccountDiscoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt AccountDiscoveryRole.Arn
+      Code:
+        ZipFile: |
+          import logging
+          import os
+          import re
+
+          import boto3
+          import cfnresponse
+          from botocore.config import Config
+
+          def discover(properties):
+              accounts = {
+                  "AuditAccountId": properties.get("AuditAccountId", ""),
+                  "LogArchiveAccountId": properties.get("LogArchiveAccountId", ""),
+              }
+              if not all(accounts.values()):
+                  region = properties.get("HomeRegion") or os.environ["AWS_REGION"]
+                  client = boto3.client(
+                      "controltower", region_name=region,
+                      config=Config(connect_timeout=3, read_timeout=10,
+                                    retries={"mode": "standard", "max_attempts": 2}))
+                  zones = []
+                  request = {}
+                  while True:
+                      page = client.list_landing_zones(**request)
+                      zones.extend(page.get("landingZones", []))
+                      token = page.get("nextToken")
+                      if not token:
+                          break
+                      request = {"nextToken": token}
+                  if len(zones) != 1:
+                      raise ValueError(
+                          f"Expected one Control Tower landing zone in {region}, found {len(zones)}. "
+                          "Check ControlTowerHomeRegion or provide both account ID overrides.")
+                  manifest = client.get_landing_zone(
+                      landingZoneIdentifier=zones[0]["arn"])["landingZone"]["manifest"]
+                  for parameter, section in (
+                          ("AuditAccountId", "securityRoles"),
+                          ("LogArchiveAccountId", "centralizedLogging")):
+                      if not accounts[parameter]:
+                          settings = manifest.get(section, {})
+                          if settings.get("enabled") is False:
+                              raise ValueError(
+                                  f"Control Tower {section} is disabled; provide {parameter} explicitly.")
+                          accounts[parameter] = settings.get("accountId")
+              for parameter, account_id in accounts.items():
+                  if not isinstance(account_id, str) or not re.fullmatch(r"[0-9]{12}", account_id):
+                      raise ValueError(
+                          f"Missing or invalid {parameter}; provide a 12-digit account ID override.")
+              return accounts
+
+          def handler(event, context):
+              physical_id = event.get("PhysicalResourceId") or (
+                  f"{event['StackId']}/{event['LogicalResourceId']}")
+              if event["RequestType"] == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+                  return
+              try:
+                  accounts = discover(event["ResourceProperties"])
+              except Exception as error:
+                  logging.exception("Control Tower account discovery failed")
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED, {}, physical_id,
+                      reason=str(error)[:1000])
+                  return
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, accounts, physical_id)
+
+  ControlTowerAccounts:
+    Type: Custom::ControlTowerAccounts
+    Properties:
+      ServiceToken: !GetAtt AccountDiscoveryFunction.Arn
+      ServiceTimeout: 150
+      AuditAccountId: !Ref AuditAccountId
+      LogArchiveAccountId: !Ref LogArchiveAccountId
+      HomeRegion: !Ref ControlTowerHomeRegion
+      RefreshToken: !Ref DiscoveryRefreshToken
+
   AssignmentRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: Watched Identity Center permission set (un)assignments
+      Description: Watched permission sets across all accounts, or any permission set targeting the management or configured Control Tower accounts
       State: ENABLED
       EventPattern:
         source: [aws.sso]
@@ -81,7 +213,12 @@ Resources:
             - [CreateAccountAssignment]
           errorCode: [{ exists: false }]
           requestParameters:
-            permissionSetArn: !Ref PermissionSetArns
+            $or:
+              - permissionSetArn: !Ref PermissionSetArns
+              - targetId:
+                  - !Ref "AWS::AccountId"
+                  - !GetAtt ControlTowerAccounts.AuditAccountId
+                  - !GetAtt ControlTowerAccounts.LogArchiveAccountId
       Targets:
         - Id: sns
           Arn: !Ref AlertTopic
@@ -214,3 +351,7 @@ Outputs:
     Value: !Ref AlertTopic
   RuleName:
     Value: !Ref AssignmentRule
+  AuditAccountId:
+    Value: !GetAtt ControlTowerAccounts.AuditAccountId
+  LogArchiveAccountId:
+    Value: !GetAtt ControlTowerAccounts.LogArchiveAccountId
